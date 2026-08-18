@@ -6,7 +6,7 @@ accuracy so that architecture selection and final evaluation are not conflated.
 
 Example
 -------
-python -m painnas.visualize_cross_fitted_results \
+python -m visualize_cross_fitted_results \
     --run-dir data/cross_fitted_loso
 """
 

@@ -12,24 +12,24 @@ from typing import Any, Iterable
 import numpy as np
 from tensorflow import keras
 
-from painnas.config import NESTED_PROTOCOL_DESCRIPTION, PainNASConfig
-from painnas.data import (
+from config import NESTED_PROTOCOL_DESCRIPTION, PainNASConfig
+from data import (
     BioVidArrays,
     build_nested_loso_fold_indices,
     compute_source_normalization,
     indices_for_subjects,
     make_tf_dataset,
 )
-from painnas.io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
-from painnas.loso import METRIC_NAMES, classification_metrics
-from painnas.model import (
+from io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
+from loso import METRIC_NAMES, classification_metrics
+from model import (
     ArchitectureSpec,
     build_early_fusion_model,
     compile_model,
     early_stopping_callbacks,
 )
-from painnas.runtime import reset_runtime
-from painnas.search import run_search
+from runtime import reset_runtime
+from search import run_search
 
 
 def _architecture_fingerprint(spec: ArchitectureSpec) -> str:

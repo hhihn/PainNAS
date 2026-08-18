@@ -1,4 +1,4 @@
-"""BioVid loading and non-episodic mini-batch construction for PainNAS."""
+"""BioVid loading and non-episodic mini-batch construction for """
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 
 from data_loaders.pain_ds_config import PainDatasetConfig
 from data_loaders.pain_meta_dataset import PainMetaDataset
-from painnas.config import PainNASConfig
+from config import PainNASConfig
 
 
 @dataclass

@@ -7,14 +7,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from painnas.config import PainNASConfig
-from painnas.cross_fitted_loso import run_cross_fitted_loso_nas
-from painnas.data import load_biovid_binary
-from painnas.io import to_jsonable
-from painnas.loso import run_loso
-from painnas.nested_loso import run_nested_loso_nas
-from painnas.runtime import require_gpu
-from painnas.search import load_architecture, run_search
+from config import PainNASConfig
+from cross_fitted_loso import run_cross_fitted_loso_nas
+from data import load_biovid_binary
+from io import to_jsonable
+from loso import run_loso
+from nested_loso import run_nested_loso_nas
+from runtime import require_gpu
+from search import load_architecture, run_search
 
 
 def _common_parser() -> argparse.ArgumentParser:

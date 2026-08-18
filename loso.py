@@ -21,21 +21,21 @@ from sklearn.metrics import (
 )
 from tensorflow import keras
 
-from painnas.config import PROTOCOL_WARNING, PainNASConfig
-from painnas.data import (
+from config import PROTOCOL_WARNING, PainNASConfig
+from data import (
     BioVidArrays,
     build_loso_fold_indices,
     compute_source_normalization,
     make_tf_dataset,
 )
-from painnas.io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
-from painnas.model import (
+from io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
+from model import (
     ArchitectureSpec,
     build_early_fusion_model,
     compile_model,
     early_stopping_callbacks,
 )
-from painnas.runtime import reset_runtime
+from runtime import reset_runtime
 
 
 METRIC_NAMES = (

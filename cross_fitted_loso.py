@@ -16,8 +16,8 @@ import optuna
 import tensorflow as tf
 from tensorflow import keras
 
-from painnas.config import CROSS_FITTED_PROTOCOL_DESCRIPTION, PainNASConfig
-from painnas.data import (
+from config import CROSS_FITTED_PROTOCOL_DESCRIPTION, PainNASConfig
+from data import (
     BioVidArrays,
     CrossFittedSubjectPlan,
     build_cross_fitted_subject_plan,
@@ -25,16 +25,16 @@ from painnas.data import (
     indices_for_subjects,
     make_tf_dataset,
 )
-from painnas.io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
-from painnas.loso import METRIC_NAMES, classification_metrics
-from painnas.model import (
+from io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
+from loso import METRIC_NAMES, classification_metrics
+from model import (
     ArchitectureSpec,
     build_early_fusion_model,
     compile_model,
     early_stopping_callbacks,
 )
-from painnas.runtime import reset_runtime
-from painnas.search import (
+from runtime import reset_runtime
+from search import (
     SEARCH_SPACE_VERSION,
     architecture_from_parameters,
     baseline_trial_parameters,
