@@ -21,21 +21,23 @@ from sklearn.metrics import (
 )
 from tensorflow import keras
 
-from config import PROTOCOL_WARNING, PainNASConfig
-from data import (
+from painnas.config import PROTOCOL_WARNING, PainNASConfig
+from painnas.data import (
     BioVidArrays,
     build_loso_fold_indices,
     compute_source_normalization,
     make_tf_dataset,
 )
-from io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
-from model import (
-    ArchitectureSpec,
-    build_early_fusion_model,
+from painnas.io import atomic_write_csv, atomic_write_json, ensure_manifest, read_json
+from painnas.model import (
+    ModelSpec,
+    aggregate_probabilities,
+    build_model,
     compile_model,
-    early_stopping_callbacks,
+    learned_fusion_weights,
+    target_output_names,
 )
-from runtime import reset_runtime
+from painnas.runtime import reset_runtime
 
 
 METRIC_NAMES = (
@@ -48,29 +50,46 @@ METRIC_NAMES = (
 )
 
 
-def _architecture_fingerprint(spec: ArchitectureSpec) -> str:
+def _architecture_fingerprint(spec: ModelSpec) -> str:
     payload = json.dumps(spec.to_dict(), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def classification_metrics(y_true: np.ndarray, probabilities: np.ndarray) -> dict[str, Any]:
     predictions = np.argmax(probabilities, axis=1).astype(np.int32)
+    labels = np.arange(probabilities.shape[1], dtype=np.int32)
     try:
-        auroc = float(roc_auc_score(y_true, probabilities[:, 1]))
+        auroc = float(
+            roc_auc_score(y_true, probabilities[:, 1])
+            if probabilities.shape[1] == 2
+            else roc_auc_score(y_true, probabilities, multi_class="ovr", average="macro")
+        )
     except ValueError:
         auroc = float("nan")
     return {
         "accuracy": float(accuracy_score(y_true, predictions)),
         "macro_f1": float(f1_score(y_true, predictions, average="macro")),
+        "precision_macro": float(
+            precision_score(y_true, predictions, average="macro", zero_division=0)
+        ),
+        "recall_macro": float(
+            recall_score(y_true, predictions, average="macro", zero_division=0)
+        ),
+        # Legacy binary field names remain available for existing summaries.
+        # For multiclass runs they carry the corresponding macro metric.
         "precision_t4": float(
             precision_score(y_true, predictions, pos_label=1, zero_division=0)
+            if probabilities.shape[1] == 2
+            else precision_score(y_true, predictions, labels=labels, average="macro", zero_division=0)
         ),
         "recall_t4": float(
             recall_score(y_true, predictions, pos_label=1, zero_division=0)
+            if probabilities.shape[1] == 2
+            else recall_score(y_true, predictions, labels=labels, average="macro", zero_division=0)
         ),
         "auroc": auroc,
-        "cross_entropy": float(log_loss(y_true, probabilities, labels=[0, 1])),
-        "confusion_matrix": confusion_matrix(y_true, predictions, labels=[0, 1]),
+        "cross_entropy": float(log_loss(y_true, probabilities, labels=labels)),
+        "confusion_matrix": confusion_matrix(y_true, predictions, labels=labels),
     }
 
 
@@ -165,6 +184,8 @@ def _write_aggregate(
     )
     summary = {
         "completed_folds": len(payloads),
+        "training_epochs": int(payloads[0]["training_epochs"]),
+        "training_epoch_source": "nas_winner_validation_best_epoch",
         "metrics": summaries,
         "aggregate_confusion_matrix": confusion,
         "protocol_warning": PROTOCOL_WARNING,
@@ -174,33 +195,51 @@ def _write_aggregate(
 
 
 def _load_completed_folds(
-    folds_dir: Path, *, architecture_fingerprint: str
+    folds_dir: Path, *, architecture_fingerprint: str, training_epochs: int
 ) -> dict[int, dict[str, Any]]:
     completed: dict[int, dict[str, Any]] = {}
     for fold_path in sorted(Path(folds_dir).glob("fold_*.json")):
         payload = read_json(fold_path)
         if payload.get("architecture_fingerprint") != architecture_fingerprint:
             raise ValueError(f"Architecture mismatch in resumed fold: {fold_path}")
+        if payload.get("training_epochs") != training_epochs:
+            raise ValueError(f"Training-epoch mismatch in resumed fold: {fold_path}")
         completed[int(payload["fold_index"])] = payload
     return completed
 
 
 def run_loso(
     arrays: BioVidArrays,
-    spec: ArchitectureSpec,
+    spec: ModelSpec,
     config: PainNASConfig,
     output_dir: Path,
     *,
     resume: bool,
+    training_epochs: int,
     start_index: int | None = None,
     stop_index: int | None = None,
     max_folds: int | None = None,
     verbose: int = 1,
 ) -> dict[str, Any]:
+    """Fit every target-exclusive fold for the NAS winner's fixed epoch count.
+
+    The epoch count must have been selected before LOSO from the winning NAS
+    trial's subject-disjoint validation curve.  LOSO does not use source-subject
+    ``Test`` samples for validation or early stopping.
+    """
+
+    training_epochs = int(training_epochs)
+    if training_epochs <= 0:
+        raise ValueError("training_epochs must be greater than zero")
     output_dir = Path(output_dir)
     folds_dir = output_dir / "folds"
     folds_dir.mkdir(parents=True, exist_ok=True)
     arrays.validate(config, require_expected_subjects=False)
+    if spec.fusion_mode != config.fusion_mode:
+        raise ValueError(
+            f"Architecture fusion mode {spec.fusion_mode!r} does not match "
+            f"configuration mode {config.fusion_mode!r}"
+        )
     architecture_fingerprint = _architecture_fingerprint(spec)
     manifest = {
         "stage": "loso",
@@ -208,6 +247,9 @@ def run_loso(
         "config_fingerprint": config.fingerprint(),
         "architecture": spec.to_dict(),
         "architecture_fingerprint": architecture_fingerprint,
+        "training_epochs": training_epochs,
+        "training_epoch_source": "nas_winner_validation_best_epoch",
+        "source_test_usage": "unused_during_training",
         "protocol_warning": PROTOCOL_WARNING,
     }
     ensure_manifest(output_dir / "manifest.json", manifest, resume=resume)
@@ -223,7 +265,9 @@ def run_loso(
     }
     payload_by_fold = (
         _load_completed_folds(
-            folds_dir, architecture_fingerprint=architecture_fingerprint
+            folds_dir,
+            architecture_fingerprint=architecture_fingerprint,
+            training_epochs=training_epochs,
         )
         if resume
         else {}
@@ -240,6 +284,8 @@ def run_loso(
             existing = read_json(fold_path)
             if existing.get("architecture_fingerprint") != architecture_fingerprint:
                 raise ValueError(f"Architecture mismatch in resumed fold: {fold_path}")
+            if existing.get("training_epochs") != training_epochs:
+                raise ValueError(f"Training-epoch mismatch in resumed fold: {fold_path}")
             payload_by_fold[fold_index] = existing
             continue
 
@@ -256,15 +302,7 @@ def run_loso(
             batch_size=config.batch_size,
             training=True,
             seed=fold_seed,
-        )
-        validation_dataset = make_tf_dataset(
-            arrays,
-            indices.validation,
-            mean=mean,
-            std=std,
-            batch_size=config.batch_size,
-            training=False,
-            seed=fold_seed,
+            target_names=target_output_names(spec),
         )
         test_dataset = make_tf_dataset(
             arrays,
@@ -274,37 +312,29 @@ def run_loso(
             batch_size=config.batch_size,
             training=False,
             seed=fold_seed,
+            target_names=target_output_names(spec),
         )
-        model = build_early_fusion_model(
-            spec,
-            input_shape=(arrays.num_modalities, arrays.sequence_length, 1),
-            num_classes=config.num_classes,
-        )
+        model = build_model(spec, input_shape=(arrays.num_modalities, arrays.sequence_length, 1), num_classes=config.num_classes, modalities=config.modalities)
         compile_model(model, spec)
         if int(model.optimizer.iterations.numpy()) != 0:
             raise RuntimeError("Fresh fold optimizer did not start at iteration zero")
-        callbacks = early_stopping_callbacks(
-            monitor="val_macro_f1", patience=config.loso_patience
-        )
+        callbacks = [keras.callbacks.TerminateOnNaN()]
         try:
             history = model.fit(
                 train_dataset,
-                validation_data=validation_dataset,
-                epochs=config.loso_max_epochs,
+                epochs=training_epochs,
                 callbacks=callbacks,
                 verbose=verbose,
             ).history
-            probabilities = np.asarray(model.predict(test_dataset, verbose=0))
+            epochs_ran = len(history.get("loss", []))
+            if epochs_ran != training_epochs:
+                raise RuntimeError(
+                    "LOSO training ended before the NAS-selected epoch budget: "
+                    f"expected {training_epochs}, ran {epochs_ran}"
+                )
+            probabilities = np.asarray(aggregate_probabilities(model, model.predict(test_dataset, verbose=0)))
             y_true = arrays.y[indices.test]
             metrics = classification_metrics(y_true, probabilities)
-            validation_scores = np.asarray(
-                history.get("val_macro_f1", []), dtype=np.float64
-            )
-            best_epoch = (
-                int(np.nanargmax(validation_scores)) + 1
-                if validation_scores.size
-                else len(history.get("loss", []))
-            )
             predictions = np.argmax(probabilities, axis=1).astype(np.int32)
             subject_key = arrays.subject_keys.get(target_subject, str(target_subject))
             prediction_rows = [
@@ -333,14 +363,17 @@ def run_loso(
                 "fold_seed": fold_seed,
                 "source_subject_count": len(indices.source_subjects),
                 "train_samples": len(indices.train),
-                "validation_samples": len(indices.validation),
+                "validation_samples": 0,
                 "test_samples": len(indices.test),
                 "normalization": {"mean": mean, "std": std},
                 "architecture_fingerprint": architecture_fingerprint,
                 "parameter_count": int(model.count_params()),
+                "fusion_weights": learned_fusion_weights(model),
                 "optimizer_initial_iterations": 0,
-                "epochs_ran": len(history.get("loss", [])),
-                "best_epoch": best_epoch,
+                "training_epochs": training_epochs,
+                "training_epoch_source": "nas_winner_validation_best_epoch",
+                "epochs_ran": epochs_ran,
+                "best_epoch": training_epochs,
                 "history": history,
                 "metrics": metrics,
                 "predictions": prediction_rows,
@@ -349,7 +382,7 @@ def run_loso(
             atomic_write_json(fold_path, payload)
             payload_by_fold[fold_index] = payload
         finally:
-            del callbacks, train_dataset, validation_dataset, test_dataset, model
+            del callbacks, train_dataset, test_dataset, model
             reset_runtime(fold_seed + 1_000_000)
             gc.collect()
         _write_aggregate(

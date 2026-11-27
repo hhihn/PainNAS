@@ -11,13 +11,24 @@ trials may change convolutional depth, width and type, temporal kernel size,
 normalization, pooling type and size, classifier-head pooling, dense depth and
 width, and Adam learning rate. ELU, softmax, and dropout `0.25` remain fixed.
 
+Use `--fusion-mode late` to search and train independent EDA, ECG, and EMG
+branches instead. The late reference trial uses the supplied seven-block EDA
+(`kernel=3`) and ECG/EMG (`kernel=11`) CNNs, then learns non-negative normalized
+weights over their softmax outputs. Branch losses have weight `0.2` each and the
+aggregate prediction has weight `0.4`; ECG and EMG never share weights. Late
+NAS searches each branch independently around that reference topology and fold
+artifacts record the final EDA/EMG/ECG fusion weights.
+
 ## Cross-fitted block NAS protocol
 
 The primary workflow partitions the 87 subjects into five deterministic outer
 blocks. NAS for one block excludes that complete block and evaluates candidates
 over three independent subject folds covering the remaining 69 or 70 subjects.
-Every development subject contributes one accuracy, and Optuna maximizes mean
-subject accuracy minus its standard error.
+Every development subject contributes one accuracy. By default, Optuna
+maximizes mean subject accuracy minus its standard error. For the plain
+performance baseline, set `architecture_selection_mode="mean_subject_accuracy"`
+on `PainNASConfig`; it ranks candidates by the same mean subject accuracy with
+no uncertainty penalty.
 
 The winning trial retains the checkpoint from its strongest inner fold. For
 each subject in the excluded block, that checkpoint initializes a new model, a
@@ -38,6 +49,8 @@ python -m painnas cross-fitted \
   --resume
 ```
 
+For the late-fusion family, add `--fusion-mode late` to the same command.
+
 By default, post-NAS warm-start training uses the rounded median best epoch from
 the winning trial's inner folds as its maximum budget. To set a different
 maximum, pass `--cross-fitted-continuation-epochs EPOCHS`, or set
@@ -54,12 +67,25 @@ completed the block. Use `--verbose 0` to disable this progress output.
 
 For Colab, open `painnas/colab_entrypoint.ipynb`. It checks out the repository,
 installs the pinned environment, stages `BioVid.tar.gz` from Drive onto the
-Colab SSD (with an extracted-Drive fallback), validates the real T0/T4 arrays,
-runs/resumes block NAS and warm-started LOSO, audits target isolation, and
-visualizes uncertainty-aware search and LOSO progress.
+Colab SSD (with an extracted-Drive fallback), and audits target isolation. Its
+default `global_search_loso` mode uses a deterministic, subject-disjoint 55/14/18
+train/validation/architecture-selection-test split. Training subjects fit each
+candidate, validation subjects control early stopping and pruning, and the
+unweighted mean test-subject macro F1 selects the architecture. The selected
+architecture is then retrained from scratch in every LOSO fold.
+Each fold trains on all 86 source subjects for the winning NAS trial's
+validation-best epoch count. Source-subject `Test` samples are not used for
+LOSO early stopping.
+Set `WORKFLOW_MODE = 'cross_fitted'` to run/resume the target-exclusive block
+NAS and warm-started LOSO protocol instead. The notebook labels the global
+workflow exploratory because architecture selection uses the complete cohort.
+For a directly comparable cross-fitted baseline, set
+`ARCHITECTURE_SELECTION_MODE = 'mean_subject_accuracy'` in the notebook's
+configuration cell and use a new `RUN_NAME`; manifests prevent mixing ranking
+modes during resume.
 
-The original nested, one-time global search, and fixed-architecture LOSO remain
-available as compatibility commands, but are not used by the Colab notebook:
+The same one-time global search, fixed-architecture LOSO, and nested protocol
+are available as command-line workflows:
 
 ```bash
 python -m painnas search --data-dir DATA --output-dir RUN --resume

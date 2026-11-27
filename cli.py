@@ -7,14 +7,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from config import PainNASConfig
-from cross_fitted_loso import run_cross_fitted_loso_nas
-from data import load_biovid_binary
-from io import to_jsonable
-from loso import run_loso
-from nested_loso import run_nested_loso_nas
-from runtime import require_gpu
-from search import load_architecture, run_search
+from painnas.config import PainNASConfig
+from painnas.cross_fitted_loso import run_cross_fitted_loso_nas
+from painnas.data import load_biovid_binary
+from painnas.io import to_jsonable
+from painnas.loso import run_loso
+from painnas.nested_loso import run_nested_loso_nas
+from painnas.runtime import require_gpu
+from painnas.search import load_architecture, load_selected_training_epochs, run_search
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -25,7 +25,15 @@ def _common_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=40)
     parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument("--search-max-epochs", type=int, default=50)
-    parser.add_argument("--loso-max-epochs", type=int, default=100)
+    parser.add_argument(
+        "--loso-max-epochs",
+        type=int,
+        default=100,
+        help=(
+            "Maximum for nested/cross-fitted training. Global fixed-architecture "
+            "LOSO loads the winning NAS best_epoch instead."
+        ),
+    )
     parser.add_argument(
         "--cross-fitted-continuation-epochs",
         type=int,
@@ -36,13 +44,33 @@ def _common_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--search-patience", type=int, default=8)
-    parser.add_argument("--loso-patience", type=int, default=15)
-    parser.add_argument("--search-validation-subjects", type=int, default=17)
+    parser.add_argument(
+        "--loso-patience",
+        type=int,
+        default=15,
+        help=(
+            "Patience for nested/cross-fitted training; unused by global fixed-"
+            "epoch LOSO."
+        ),
+    )
+    parser.add_argument(
+        "--search-validation-subjects",
+        type=int,
+        default=17,
+        help=(
+            "Validation-subject count for nested search. Global search uses its "
+            "fixed two-stage 80/20 subject split."
+        ),
+    )
     parser.add_argument("--outer-block-count", type=int, default=5)
     parser.add_argument("--inner-fold-count", type=int, default=3)
     parser.add_argument("--uncertainty-beta", type=float, default=1.0)
     parser.add_argument("--max-parameters", type=int, default=32_000_000)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
+    parser.add_argument(
+        "--fusion-mode", choices=("early", "late"), default="early",
+        help="Base architecture family for NAS and LOSO (default: early).",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--allow-cpu",
@@ -115,6 +143,7 @@ def _config_from_args(args: argparse.Namespace) -> PainNASConfig:
         uncertainty_beta=args.uncertainty_beta,
         max_parameters=args.max_parameters,
         bootstrap_samples=args.bootstrap_samples,
+        fusion_mode=args.fusion_mode,
     )
 
 
@@ -170,12 +199,14 @@ def run_command(args: argparse.Namespace) -> dict[str, Any]:
             else output_dir / "search" / "best_architecture.json"
         )
         spec = load_architecture(architecture_path)
+        training_epochs = load_selected_training_epochs(architecture_path)
         result["loso"] = run_loso(
             arrays,
             spec,
             config,
             output_dir / "loso",
             resume=bool(args.resume),
+            training_epochs=training_epochs,
             start_index=getattr(args, "loso_start_index", None),
             stop_index=getattr(args, "loso_stop_index", None),
             max_folds=getattr(args, "max_folds", None),

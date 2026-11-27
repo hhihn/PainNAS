@@ -1,4 +1,4 @@
-"""BioVid loading and non-episodic mini-batch construction for """
+"""BioVid loading and non-episodic mini-batch construction for PainNAS."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ import numpy as np
 
 from data_loaders.pain_ds_config import PainDatasetConfig
 from data_loaders.pain_meta_dataset import PainMetaDataset
-from config import PainNASConfig
+from painnas.config import PainNASConfig
+
+
+GLOBAL_SEARCH_TEST_FRACTION = 0.20
+GLOBAL_SEARCH_VALIDATION_FRACTION = 0.20
 
 
 @dataclass
 class BioVidArrays:
-    """In-memory binary BioVid arrays independent of few-shot samplers."""
+    """In-memory BioVid arrays with class labels remapped to consecutive indices."""
 
     X: np.ndarray
     y: np.ndarray
@@ -56,8 +60,12 @@ class BioVidArrays:
                 f"Expected sequence length {config.expected_sequence_length}, "
                 f"got {self.sequence_length}"
             )
-        if set(np.unique(self.y).tolist()) != {0, 1}:
-            raise ValueError("Binary PainNAS labels must be remapped to exactly {0, 1}")
+        expected_labels = set(range(config.num_classes))
+        if set(np.unique(self.y).tolist()) != expected_labels:
+            raise ValueError(
+                "PainNAS labels must be remapped to every consecutive class index "
+                f"in {sorted(expected_labels)}"
+            )
         if not np.all(np.isfinite(self.X)):
             raise ValueError("Input arrays contain NaN or infinite values")
 
@@ -81,6 +89,47 @@ class NestedFoldIndices:
     inner_train_subjects: tuple[int, ...]
     inner_validation_subjects: tuple[int, ...]
     target_subject: int
+
+
+@dataclass(frozen=True)
+class SearchSubjectSplit:
+    """Deterministic global-NAS train/validation/test subject partition."""
+
+    train_subjects: tuple[int, ...]
+    validation_subjects: tuple[int, ...]
+    test_subjects: tuple[int, ...]
+    seed: int
+    test_fraction: float
+    validation_fraction: float
+
+    def validate(self, subjects: Iterable[int]) -> None:
+        known_values = tuple(int(value) for value in subjects)
+        known = set(known_values)
+        if len(known_values) != len(known):
+            raise ValueError("Available subjects must not contain duplicates")
+        groups = {
+            "train": self.train_subjects,
+            "validation": self.validation_subjects,
+            "test": self.test_subjects,
+        }
+        for name, values in groups.items():
+            if not values:
+                raise RuntimeError(f"Global NAS {name} subjects must be non-empty")
+            if len(values) != len(set(values)):
+                raise RuntimeError(f"Global NAS {name} subjects contain duplicates")
+        names = tuple(groups)
+        for index, left_name in enumerate(names):
+            for right_name in names[index + 1 :]:
+                if set(groups[left_name]) & set(groups[right_name]):
+                    raise RuntimeError(
+                        f"Global NAS {left_name} and {right_name} subjects overlap"
+                    )
+        selected = set().union(*(set(values) for values in groups.values()))
+        if selected != known:
+            raise RuntimeError(
+                "Global NAS train, validation, and test subjects must exactly "
+                "cover the available subjects"
+            )
 
 
 @dataclass(frozen=True)
@@ -155,7 +204,12 @@ def build_cross_fitted_subject_plan(
 
 
 def load_biovid_binary(data_dir: str, config: PainNASConfig) -> BioVidArrays:
-    """Load GSR/ECG/EMG and filter BioVid to T0 versus T4."""
+    """Load selected BioVid classes and remap them to consecutive indices.
+
+    The historical function name is retained for API compatibility.  The selected
+    raw class indices are controlled by ``config.raw_class_ids`` and may describe
+    either a binary or a multi-class task.
+    """
 
     dataset_config = PainDatasetConfig(
         dataset_source="biovid_part_a",
@@ -172,19 +226,20 @@ def load_biovid_binary(data_dir: str, config: PainNASConfig) -> BioVidArrays:
         normalize=False,
         normalize_per_subject=False,
     )
-    binary_mask = np.isin(dataset.y, config.raw_class_ids)
-    raw_y = dataset.y[binary_mask]
-    remapped_y = (raw_y == config.raw_class_ids[1]).astype(np.int32)
+    class_mask = np.isin(dataset.y, config.raw_class_ids)
+    raw_y = dataset.y[class_mask]
+    raw_to_index = {raw_class: index for index, raw_class in enumerate(config.raw_class_ids)}
+    remapped_y = np.asarray([raw_to_index[int(label)] for label in raw_y], dtype=np.int32)
     subject_keys = {
         int(key): str(value)
         for key, value in dataset.predefined_subject_int_to_key.items()
     }
     arrays = BioVidArrays(
-        X=np.ascontiguousarray(dataset.X[binary_mask], dtype=np.float32),
+        X=np.ascontiguousarray(dataset.X[class_mask], dtype=np.float32),
         y=remapped_y,
-        subjects=np.ascontiguousarray(dataset.subjects[binary_mask], dtype=np.int32),
+        subjects=np.ascontiguousarray(dataset.subjects[class_mask], dtype=np.int32),
         split_codes=np.ascontiguousarray(
-            dataset.sample_split_codes[binary_mask], dtype=np.int8
+            dataset.sample_split_codes[class_mask], dtype=np.int8
         ),
         subject_keys=subject_keys,
         train_split_code=dataset.split_name_to_code["train"],
@@ -205,6 +260,63 @@ def deterministic_search_subject_split(
     validation = tuple(sorted(int(value) for value in shuffled[:validation_subjects]))
     training = tuple(sorted(int(value) for value in shuffled[validation_subjects:]))
     return training, validation
+
+
+def deterministic_global_search_subject_split(
+    subjects: Iterable[int],
+    *,
+    seed: int,
+    test_fraction: float = GLOBAL_SEARCH_TEST_FRACTION,
+    validation_fraction: float = GLOBAL_SEARCH_VALIDATION_FRACTION,
+) -> SearchSubjectSplit:
+    """Split subjects 80/20, then split the development subjects 80/20.
+
+    Counts use ceiling for each held-out fraction.  With 87 subjects this yields
+    55 training, 14 validation, and 18 architecture-selection test subjects.
+    """
+
+    ordered_values = tuple(sorted(int(subject) for subject in subjects))
+    if len(ordered_values) != len(set(ordered_values)):
+        raise ValueError("subjects must not contain duplicates")
+    if len(ordered_values) < 3:
+        raise ValueError("At least three subjects are required for a three-way split")
+    for name, fraction in (
+        ("test_fraction", test_fraction),
+        ("validation_fraction", validation_fraction),
+    ):
+        if not 0.0 < float(fraction) < 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
+
+    test_count = int(np.ceil(len(ordered_values) * float(test_fraction)))
+    development_count = len(ordered_values) - test_count
+    validation_count = int(
+        np.ceil(development_count * float(validation_fraction))
+    )
+    train_count = development_count - validation_count
+    if min(train_count, validation_count, test_count) <= 0:
+        raise ValueError(
+            "Requested fractions do not leave non-empty train, validation, and test sets"
+        )
+
+    shuffled = np.random.default_rng(seed).permutation(
+        np.asarray(ordered_values, dtype=np.int32)
+    )
+    test_stop = test_count
+    validation_stop = test_stop + validation_count
+    split = SearchSubjectSplit(
+        train_subjects=tuple(
+            sorted(int(value) for value in shuffled[validation_stop:])
+        ),
+        validation_subjects=tuple(
+            sorted(int(value) for value in shuffled[test_stop:validation_stop])
+        ),
+        test_subjects=tuple(sorted(int(value) for value in shuffled[:test_stop])),
+        seed=int(seed),
+        test_fraction=float(test_fraction),
+        validation_fraction=float(validation_fraction),
+    )
+    split.validate(ordered_values)
+    return split
 
 
 def indices_for_subjects(
@@ -346,6 +458,7 @@ def make_tf_dataset(
     batch_size: int,
     training: bool,
     seed: int,
+    target_names: tuple[str, ...] | None = None,
 ):
     """Build a vectorized channels-last 2D CNN input pipeline."""
 
@@ -353,6 +466,7 @@ def make_tf_dataset(
 
     selected_X = arrays.X[indices]
     selected_y = arrays.y[indices]
+    class_count = int(np.max(arrays.y)) + 1
     dataset = tf.data.Dataset.from_tensor_slices((selected_X, selected_y))
     if training:
         dataset = dataset.shuffle(
@@ -368,8 +482,10 @@ def make_tf_dataset(
         normalized = (tf.cast(batch_X, tf.float32) - mean_tensor) / std_tensor
         transposed = tf.transpose(normalized, perm=(0, 2, 1))
         model_input = tf.expand_dims(transposed, axis=-1)
-        one_hot_y = tf.one_hot(batch_y, depth=2, dtype=tf.float32)
-        return model_input, one_hot_y
+        one_hot_y = tf.one_hot(batch_y, depth=class_count, dtype=tf.float32)
+        if target_names is None or len(target_names) == 1:
+            return model_input, one_hot_y
+        return model_input, {name: one_hot_y for name in target_names}
 
     dataset = dataset.map(
         prepare_batch,

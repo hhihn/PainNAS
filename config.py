@@ -23,13 +23,15 @@ class PainNASConfig:
     search_validation_subjects: int = 17
     outer_block_count: int = 5
     inner_fold_count: int = 3
+    architecture_selection_mode: str = "uncertainty_aware"
     uncertainty_beta: float = 1.0
     max_parameters: int = 32_000_000
     bootstrap_samples: int = 10_000
     dropout_rate: float = 0.25
     num_classes: int = 2
-    raw_class_ids: tuple[int, int] = (0, 4)
+    raw_class_ids: tuple[int, ...] = (0, 4)
     modalities: tuple[str, str, str] = ("GSR", "ECG", "EMG")
+    fusion_mode: str = "early"
     expected_sequence_length: int = 1152
     expected_subjects: int = 87
 
@@ -62,21 +64,37 @@ class PainNASConfig:
             raise ValueError("outer_block_count must be >= 2")
         if self.inner_fold_count < 2:
             raise ValueError("inner_fold_count must be >= 2")
+        if self.architecture_selection_mode not in {
+            "uncertainty_aware",
+            "mean_subject_accuracy",
+        }:
+            raise ValueError(
+                "architecture_selection_mode must be 'uncertainty_aware' or "
+                "'mean_subject_accuracy'"
+            )
         if self.uncertainty_beta < 0:
             raise ValueError("uncertainty_beta must be >= 0")
-        if self.num_classes != 2 or self.raw_class_ids != (0, 4):
-            raise ValueError("PainNAS currently implements binary BioVid T0-vs-T4 only")
+        if len(self.raw_class_ids) < 2:
+            raise ValueError("raw_class_ids must contain at least two class indices")
+        if len(set(self.raw_class_ids)) != len(self.raw_class_ids):
+            raise ValueError("raw_class_ids must not contain duplicates")
+        if self.num_classes != len(self.raw_class_ids):
+            raise ValueError("num_classes must equal len(raw_class_ids)")
         if len(self.modalities) != 3:
             raise ValueError("PainNAS requires exactly three physiological modalities")
+        if self.fusion_mode not in {"early", "late"}:
+            raise ValueError("fusion_mode must be 'early' or 'late'")
         if not 0.0 <= self.dropout_rate < 1.0:
             raise ValueError("dropout_rate must be in [0, 1)")
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        # Omitting the disabled option preserves manifests and fingerprints from
-        # runs created before this override was introduced.
+        # Omitting default/disabled options preserves manifests and fingerprints
+        # from runs created before these overrides were introduced.
         if self.cross_fitted_continuation_epochs is None:
             payload.pop("cross_fitted_continuation_epochs")
+        if self.architecture_selection_mode == "uncertainty_aware":
+            payload.pop("architecture_selection_mode")
         return payload
 
     def fingerprint(self) -> str:
