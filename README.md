@@ -1,146 +1,166 @@
 # PainNAS
 
-`painnas` is a standalone supervised baseline for automated pain assessment on
-BioVid Part A. It deliberately does not import or use the repository's episodic
-samplers, prototypes, support/query construction, or few-shot adaptation.
+PainNAS searches convolutional neural networks for supervised pain assessment
+from BioVid Part A physiological signals. It supports subject-disjoint neural
+architecture search (NAS), leave-one-subject-out (LOSO) evaluation, and
+resumable experiments. The default task distinguishes baseline (`T0`) from
+high pain (`T4`) using GSR/EDA, ECG, and EMG.
 
-The input is early-fused in the order GSR/EDA, ECG, EMG and transformed from the
-repository layout `[batch, 1152, 3]` to `[batch, 3, 1152, 1]`. Only `T0` and `T4`
-are retained. The exact supplied Table 2 CNN is enqueued as Optuna trial 0; later
-trials may change convolutional depth, width and type, temporal kernel size,
-normalization, pooling type and size, classifier-head pooling, dense depth and
-width, and Adam learning rate. ELU, softmax, and dropout `0.25` remain fixed.
+Inputs have shape `[samples, 1152, 3]` and are rearranged for the model to
+`[samples, 3, 1152, 1]`. Early fusion combines the signals at the input; late
+fusion trains separate modality branches and learns normalized prediction
+weights. Optuna searches architecture and training choices, starting with a
+reference CNN.
 
-Use `--fusion-mode late` to search and train independent EDA, ECG, and EMG
-branches instead. The late reference trial uses the supplied seven-block EDA
-(`kernel=3`) and ECG/EMG (`kernel=11`) CNNs, then learns non-negative normalized
-weights over their softmax outputs. Branch losses have weight `0.2` each and the
-aggregate prediction has weight `0.4`; ECG and EMG never share weights. Late
-NAS searches each branch independently around that reference topology and fold
-artifacts record the final EDA/EMG/ECG fusion weights.
+Paper: [Efficient Architecture Search under Leave-One-Subject-Out Evaluation](https://arxiv.org/pdf/2609.21457).
 
-## Cross-fitted block NAS protocol
+## Citation
 
-The primary workflow partitions the 87 subjects into five deterministic outer
-blocks. NAS for one block excludes that complete block and evaluates candidates
-over three independent subject folds covering the remaining 69 or 70 subjects.
-Every development subject contributes one accuracy. By default, Optuna
-maximizes mean subject accuracy minus its standard error. For the plain
-performance baseline, set `architecture_selection_mode="mean_subject_accuracy"`
-on `PainNASConfig`; it ranks candidates by the same mean subject accuracy with
-no uncertainty penalty.
+```bibtex
+@article{hihn2026efficient,
+  title={Efficient Architecture Search under Leave-One-Subject-Out Evaluation},
+  author={Hihn, Heinke and Schwenker, Friedhelm},
+  journal={arXiv preprint arXiv:2609.21457},
+  year={2026}
+}
+```
 
-The winning trial retains the checkpoint from its strongest inner fold. For
-each subject in the excluded block, that checkpoint initializes a new model, a
-fresh optimizer is created, and training continues on all other 86 subjects for
-at most the median inner best epoch. Source-subject `Test` samples control early
-stopping with best-weight restoration; the target subject remains excluded and
-is evaluated only after fitting. The five block searches replace 87 independent
-NAS runs while keeping each target excluded from architecture selection.
+## Requirements and setup
+
+- Python with TensorFlow 2.20, NumPy, pandas, scikit-learn, and Optuna. The
+  provided `requirements-colab.txt` pins TensorFlow; the other packages are
+  unpinned. Install Matplotlib separately to generate result plots.
+- A TensorFlow-compatible GPU is expected for full experiments. `--allow-cpu`
+  permits CPU runs for debugging.
+- Access to the preprocessed BioVid Part A dataset with its predefined Train and
+  Test splits. The default loader expects 87 subjects, 1,152 time points per
+  sample, and the three modalities above. Data is not included here.
+- The `data_loaders` package from
+  [FewShotPainAdaptation](https://github.com/hhihn/FewShotPainAdaptation),
+  including `pain_ds_config` and `pain_meta_dataset`. It is **not included** in
+  this repository or installed by `requirements-colab.txt`. The Colab staging
+  step also requires its `dataset_staging` module. Use a compatible checkout and
+  follow its data preparation instructions.
+
+The source imports this repository as `painnas`, although this checkout has no
+package installation metadata. One way to run locally is to put this checkout
+in a directory named `painnas` and put both its parent and the directory
+containing `data_loaders` on `PYTHONPATH`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-colab.txt matplotlib
+export PYTHONPATH="/path/to/parent-of-painnas:/path/to/FewShotPainAdaptation:$PYTHONPATH"
+python -m painnas --help
+```
+
+The TensorFlow pin targets the Colab environment; local GPU support depends on
+the operating system and TensorFlow installation. Point `--data-dir` to the
+dataset root expected by the external loader.
+
+## Evaluation protocols
+
+**Cross-fitted block NAS** (`cross-fitted`) partitions subjects into five
+deterministic outer blocks by default. For each block, NAS excludes the entire
+block and evaluates each remaining subject in one of three inner subject folds.
+The default selection score is mean subject accuracy minus its standard error
+(`--uncertainty-beta` controls the penalty). The strongest inner-fold
+checkpoint of the winning trial initializes each target's model. A fresh
+optimizer continues training on the other subjects, using source-subject Test
+samples for early stopping; evaluation uses only the target's Test samples.
+The default continuation budget is the rounded median inner best epoch.
+
+**Nested LOSO** (`nested`) runs a separate target-exclusive search for each
+subject, then trains a freshly initialized model on source subjects and tests
+on the held-out target. This is more computationally expensive.
+
+**Global search and LOSO** (`search`, `loso`, or `all`) selects an architecture
+once using a subject-disjoint search split, then retrains it from scratch for
+each target. The search uses all subject identities, so its subsequent LOSO
+summary is exploratory and is not an unbiased nested-LOSO estimate. The search
+uses 55 training, 14 validation, and 18 architecture-selection test subjects
+with the default cohort and seed.
 
 ## Run
 
-The paper-scale defaults require a TensorFlow GPU:
+From an environment configured as above, start or resume cross-fitted NAS:
 
 ```bash
 python -m painnas cross-fitted \
-  --data-dir "/content/drive/MyDrive/PainData/BioVid 2" \
-  --output-dir "/content/drive/MyDrive/PainNAS/run_001" \
+  --data-dir /path/to/BioVid-data \
+  --output-dir /path/to/runs/run_001 \
   --resume
 ```
 
-For the late-fusion family, add `--fusion-mode late` to the same command.
+Add `--fusion-mode late` for late fusion. Cross-fitted and nested CLI commands
+default to 10 trials and 20 search epochs; global search defaults to 50 trials
+and 50 search epochs. Use `--n-trials`, `--search-max-epochs`, and
+`--cross-fitted-continuation-epochs` to change the budget. Run
+`python -m painnas cross-fitted --help` for all options. Configuration values
+not exposed by the CLI, including `architecture_selection_mode`, can be set on
+`PainNASConfig` when using the Python API or notebook.
 
-By default, post-NAS warm-start training uses the rounded median best epoch from
-the winning trial's inner folds as its maximum budget. To set a different
-maximum, pass `--cross-fitted-continuation-epochs EPOCHS`, or set
-`cross_fitted_continuation_epochs=EPOCHS` on `PainNASConfig` in the Colab
-configuration cell.
-
-With `--verbose 1` (the default), PainNAS prints intermediate loss, accuracy,
-macro F1, and subject-macro validation accuracy after every NAS/continuation
-epoch. It also reports epoch-level ETAs, held-out metrics after every completed
-LOSO fold, and a continuation ETA for the remaining selected folds. Explicit
-stage messages identify the current outer block and whether PainNAS is searching
-for an architecture, has selected one, is fitting a LOSO target subject, or has
-completed the block. Use `--verbose 0` to disable this progress output.
-
-For Colab, open `painnas/colab_entrypoint.ipynb`. It checks out the repository,
-installs the pinned environment, stages `BioVid.tar.gz` from Drive onto the
-Colab SSD (with an extracted-Drive fallback), and audits target isolation. Its
-default `global_search_loso` mode uses a deterministic, subject-disjoint 55/14/18
-train/validation/architecture-selection-test split. Training subjects fit each
-candidate, validation subjects control early stopping and pruning, and the
-unweighted mean test-subject macro F1 selects the architecture. The selected
-architecture is then retrained from scratch in every LOSO fold.
-Each fold trains on all 86 source subjects for the winning NAS trial's
-validation-best epoch count. Source-subject `Test` samples are not used for
-LOSO early stopping.
-Set `WORKFLOW_MODE = 'cross_fitted'` to run/resume the target-exclusive block
-NAS and warm-started LOSO protocol instead. The notebook labels the global
-workflow exploratory because architecture selection uses the complete cohort.
-For a directly comparable cross-fitted baseline, set
-`ARCHITECTURE_SELECTION_MODE = 'mean_subject_accuracy'` in the notebook's
-configuration cell and use a new `RUN_NAME`; manifests prevent mixing ranking
-modes during resume.
-
-The same one-time global search, fixed-architecture LOSO, and nested protocol
-are available as command-line workflows:
+Other workflows:
 
 ```bash
+python -m painnas nested --data-dir DATA --output-dir RUN --resume
 python -m painnas search --data-dir DATA --output-dir RUN --resume
 python -m painnas loso --data-dir DATA --output-dir RUN --resume
-python -m painnas nested --data-dir DATA --output-dir RUN --resume
+# Alternatively, run search and LOSO together:
+python -m painnas all --data-dir DATA --output-dir RUN --resume
 ```
 
-Cross-fitted jobs can be split across sessions without changing the manifest:
+`loso` reads `RUN/search/best_architecture.json` by default; use
+`--architecture-json` to specify another selection. Fold ranges are one-based
+and inclusive, allowing long jobs to be split across sessions:
 
 ```bash
 python -m painnas cross-fitted --data-dir DATA --output-dir RUN --resume \
   --loso-start-index 1 --loso-stop-index 30
-python -m painnas cross-fitted --data-dir DATA --output-dir RUN --resume \
-  --loso-start-index 31 --loso-stop-index 60
-python -m painnas cross-fitted --data-dir DATA --output-dir RUN --resume \
-  --loso-start-index 61 --loso-stop-index 87
 ```
 
-Use `--allow-cpu`, small epoch counts, and `--max-folds` only for debugging:
+For a small smoke run on CPU, use `--allow-cpu --n-trials 1
+--search-max-epochs 1 --outer-block-count 2 --inner-fold-count 2 --max-folds 1
+--bootstrap-samples 100`. The real dataset and external loader are still
+required. Resume checks configuration and architecture fingerprints; use a new
+output directory when changing settings.
 
-```bash
-python -m painnas cross-fitted \
-  --data-dir "data/BioVid 2" \
-  --output-dir /tmp/painnas_smoke \
-  --n-trials 1 \
-  --search-max-epochs 1 \
-  --outer-block-count 2 \
-  --inner-fold-count 2 \
-  --max-folds 1 \
-  --bootstrap-samples 100 \
-  --allow-cpu
-```
+## Colab
 
-## Outputs
+[colab_entrypoint.ipynb](colab_entrypoint.ipynb) clones the
+FewShotPainAdaptation repository and installs its `painnas` requirements, stages
+BioVid from Google Drive, and runs the configured workflow. It currently
+defaults to `cross_fitted_weight_sharing`, late fusion, and a reference run:
+set `REFERENCE_RUN_DIR` to an existing cross-fitted run before using that mode.
+Alternatively set `WORKFLOW_MODE` to `cross_fitted` or `global_search_loso`.
+Review the repository branch, data paths, run name, and configuration cells
+before running: the notebook uses the `painnas` code in its cloned checkout,
+which may differ from this repository. The weight-sharing mode screens
+candidates from a previous cross-fitted run before independently refitting a
+shortlist.
 
-- `cross_fitted_loso/blocks/block_NNN/search/study.sqlite3`: resumable study
-- `cross_fitted_loso/blocks/block_NNN/search/best_warmstart.weights.h5`: winner checkpoint
-- `cross_fitted_loso/blocks/block_NNN/search/best_architecture.json`: block selection
-- `cross_fitted_loso/folds/fold_NNN/result.json`: continuation audit and predictions
-- `cross_fitted_loso/fold_metrics.csv` and `predictions.csv`: analysis-ready tables
-- `cross_fitted_loso/architecture_frequencies.csv`: selected-architecture counts
-- `cross_fitted_loso/summary.json`: metrics, confusion matrix, and bootstrap CIs
+[best_architecture_full_loso_colab.ipynb](best_architecture_full_loso_colab.ipynb)
+provides a separate fixed-architecture LOSO workflow and also uses the external
+checkout.
 
-Visualize a completed run as a publication-ready PNG (and optionally a vector
-PDF) and print its selection and test metrics:
+## Results
+
+Cross-fitted runs write the following under `RUN/cross_fitted_loso/`:
+
+- `blocks/block_NNN/search/study.sqlite3`: resumable Optuna study.
+- `blocks/block_NNN/search/best_architecture.json` and
+  `best_warmstart.weights.h5`: selected architecture and checkpoint.
+- `folds/fold_NNN/result.json`: target-fold audit, metrics, and predictions.
+- `fold_metrics.csv`, `predictions.csv`, `architecture_frequencies.csv`, and
+  `summary.json`: aggregate results, including bootstrap confidence intervals.
+
+Generate a PNG and optional PDF overview with:
 
 ```bash
 python -m painnas.visualize_cross_fitted_results \
-  --run-dir data/cross_fitted_loso \
-  --pdf
+  --run-dir RUN/cross_fitted_loso --pdf
 ```
 
-The selection panel reports the inner subject-macro validation accuracy used to
-choose each block's architecture, including its standard error and penalized
-objective. It is distinct from the held-out LOSO test accuracy and macro F1.
-
-Resume is guarded by configuration and architecture fingerprints. If settings
-change, start a new output directory.
+The plot distinguishes inner subject-macro validation accuracy used for
+architecture selection from held-out LOSO test metrics.
